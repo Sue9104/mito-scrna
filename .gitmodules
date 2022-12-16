@@ -1,0 +1,3 @@
+[submodule "gatk4-mitochondria-pipeline"]
+	path = gatk4-mitochondria-pipeline
+	url = https://github.com/gatk-workflows/gatk4-mitochondria-pipeline.git
