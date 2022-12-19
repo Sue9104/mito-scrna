@@ -1,0 +1,175 @@
+import os
+import pandas as pd
+
+
+genome = config["genome"]
+project = config["project"]
+mailto = config["mailto"]
+outdir = os.path.abspath(config["outdir"])
+os.makedirs(outdir, exist_ok=True)
+info = pd.read_csv(config["infile"])
+samples = info["sample"].tolist()
+
+workdir: outdir
+rule all:
+    input:
+        expand([outdir + "/final/{sample}.final.vcf"], sample=samples)
+
+rule mapping:
+    input:
+        genome = config["genome"]
+    output:
+        sort = outdir + "/mapping/{sample}.sorted.bam",
+        mark = outdir + "/mapping/{sample}.marked.bam",
+        metrics = outdir + "/mapping/{sample}.markdup_metrics.txt"
+    log: outdir + "/logs/mapping.{sample}.log"
+    benchmark: outdir + "/benchmarks/mapping.{sample}.benchmarks.tsv"
+    params:
+        bwa = "bwa mem -K 100000000 -v 3 -Y ",
+        samtools = "samtools sort ",
+        gatk = "gatk --java-options '-Xmx40G' MarkDuplicatesSpark"
+    threads: 40
+    run:
+        os.makedirs(os.path.join(outdir, "mapping"), exist_ok=True)
+        sample = os.path.basename(output.sort).replace(".sorted.bam","")
+        r1 = info[info["sample"]==sample]["r1"].squeeze()
+        r2 = info[info["sample"]==sample]["r2"].squeeze()
+        cmd  = f"[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; "
+        cmd += f"{params.bwa} -t {threads} -R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:MT\\tPL:Illumina' "
+        cmd += f"{genome} {r1} {r2} 2> >(tee {log} >&2) | "
+        cmd += f"{params.samtools} -@ {threads} -o {output.sort} -; "
+        cmd += f"{params.gatk} -conf 'spark.executor.cores={threads} ' "
+        cmd += f"--input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;"
+        print(cmd)
+        subprocess.run(cmd, shell=True, executable='/bin/bash')
+
+rule mapping_shift:
+    input:
+        genome = config["genome_shift"]
+    output:
+        sort = outdir + "/mapping/{sample}.shift.sorted.bam",
+        mark = outdir + "/mapping/{sample}.shift.marked.bam",
+        metrics = outdir + "/mapping/{sample}.shift.markdup_metrics.txt"
+    log: outdir + "logs/mapping.{sample}.shift.log"
+    benchmark: outdir + "/benchmarks/mapping.{sample}.shift.benchmarks.tsv"
+    params:
+        bwa = "bwa mem -K 100000000 -p -v 3 -Y ",
+        samtools = "samtools sort ",
+        gatk = "gatk --java-options '-Xmx60G' MarkDuplicatesSpark"
+    threads: 40
+    run:
+        sample = os.path.basename(output.sort).replace(".sorted.bam","")
+        r1 = info[info["sample"]==sample]["r1"].squeeze()
+        r2 = info[info["sample"]==sample]["r2"].squeeze()
+        cmd  = f"{params.bwa} -t {threads} {genome} {r1} {r2} 2> >(tee {log}>&2) | "
+        cmd += f"{params.samtools} -@ {threads} -o {output.sort} -; "
+        cmd += f" {params.gatk} -conf 'spark.executor.cores={threads}' "
+        cmd += f"--input {input} --output {output.mark} --metrics-file {output.metrics} "
+        cmd += f"> >(tee {log}) 2>&1;"
+        print(cmd)
+        subprocess.run(cmd, shell=True, executable='/bin/bash')
+
+
+rule collect_metrics:
+    input:
+        outdir + "/mapping/{sample}.marked.bam"
+    output:
+        outdir + "/mapping/{sample}.mt.metrics.txt"
+    params:
+        read_length = 150,
+        coverage_cap = 100000
+    threads: 40
+    benchmark: outdir + "/benchmarks/collectwgs.{sample}.benchmarks.tsv"
+    log: outdir + "/logs/collectwgs.{sample}.log"
+    shell:
+        "gatk CollectWgsMetrics --VALIDATION_STRINGENCY SILENT --USE_FAST_ALGORITHM true --INCLUDE_BQ_HISTOGRAM true "
+        "-CAP {params.coverage_cap} --READ_LENGTH {params.read_length}  "
+        "-R {genome} -I {input} -O {output} > >(tee {log}) 2>&1"
+
+rule call_mt:
+    input:
+        bam = outdir + "/mapping/{sample}.marked.bam",
+        genome = config["genome"],
+        interval = config["noncontrol_region_interval"]
+    output:
+        bam = outdir + "/call-variants/{sample}.non-control_region.bam",
+        vcf = outdir + "/call-variants/{sample}.non-control_region.vcf",
+        metrics = outdir + "/call-variants/{sample}.non-control_region.metrics.tsv",
+        base = outdir + "/call-variants/{sample}.non-control_region.bases.tsv",
+        stat = outdir + "/call-variants/{sample}.non-control_region.stats.tsv"
+    threads: 40
+    benchmark: outdir + "/benchmarks/callmt.{sample}.benchmarks.tsv"
+    log: outdir + "/logs/callmt.{sample}.log"
+    params:
+        gatk_mutect2 = "gatk --java-options '-Xmx64G' Mutect2 --mitochondria-mode --max-reads-per-alignment-start 75 --max-mnp-distance 0",
+        gatk_collecths = "gatk  CollectHsMetrics --SAMPLE_SIZE 1 -covMax 20000 ",
+        region = config["noncontrol_region"],
+    shell:
+        "[ ! -d {outdir}/call-variants ] && mkdir {outdir}/call-variants; "
+        "{params.gatk_mutect2} -R {input.genome} -L {params.region} "
+        "  -I {input.bam} --bam-output {output.bam} -O {output.vcf} "
+        "&& {params.gatk_collecths} -R {input.genome} -TI {input.interval} -BI {input.interval} "
+        "  -I {input.bam} -O {output.metrics} --PER_BASE_COVERAGE {output.base} > >(tee {log}) 2>&1;"
+        "paste <(sed -n '7p' {output.metrics}| tr '\t' '\n') <(sed -n '8p' {output.metrics}| tr '\t' '\n') > {output.stat}"
+
+rule call_mt_shift:
+    input:
+        bam = outdir + "/mapping/{sample}.marked.bam",
+        genome = config["genome_shift"],
+        interval = config["control_region_shift_interval"],
+    output:
+        bam = outdir + "/call-variants/{sample}.control_region.bam",
+        vcf = outdir + "/call-variants/{sample}.control_region.vcf",
+        metrics = outdir + "/call-variants/{sample}.control_region.metrics.tsv",
+        base = outdir + "/call-variants/{sample}.control_region.bases.tsv",
+        stat = outdir + "/call-variants/{sample}.control_region.stats.tsv"
+    threads: 40
+    benchmark: outdir + "/benchmarks/callmtshift.{sample}.benchmarks.tsv"
+    log: outdir + "/logs/callmtshift.{sample}.log"
+    params:
+        gatk_mutect2 = "gatk --java-options '-Xmx64G' Mutect2 --mitochondria-mode --max-reads-per-alignment-start 75 --max-mnp-distance 0",
+        gatk_collecths = "gatk  CollectHsMetrics --SAMPLE_SIZE 1 -covMax 20000 ",
+        region = config["control_region_shift"],
+    shell:
+        "[ ! -d {outdir}/call-variants ] && mkdir {outdir}/call-variants; "
+        "{params.gatk_mutect2} -R {input.genome} -L {params.region} "
+        "  -I {input.bam} --bam-output {output.bam} -O {output.vcf} "
+        "&& {params.gatk_collecths} -R {input.genome} -TI {input.interval} -BI {input.interval} "
+        "  -I {input.bam} -O {output.metrics} --PER_BASE_COVERAGE {output.base} > >(tee {log}) 2>&1;"
+        "paste <(sed -n '7p' {output.metrics}| tr '\t' '\n') <(sed -n '8p' {output.metrics}| tr '\t' '\n') > {output.stat}"
+
+
+rule liftover_combinevcf:
+    input:
+        vcf = outdir + "/call-variants/{sample}.non-control_region.vcf",
+        vcf_shift = outdir + "/call-variants/{sample}.control_region.vcf",
+        chain = config["chain"]
+    output:
+        vcf_back = outdir + "/call-variants/{sample}.control_region.shiftback.vcf",
+        vcf_reject = outdir + "/call-variants/{sample}.control_region.shiftback.rejected.vcf",
+        final = outdir + "/call-variants/{sample}.final.vcf"
+    benchmark: outdir + "/benchmarks/liftover.{sample}.benchmarks.tsv"
+    log: outdir + "/logs/liftover.{sample}.log"
+    shell:
+        "gatk LiftoverVcf -R {genome} -C {input.chain} "
+        "-I {input.vcf_shift} -O {output.vcf_back} --REJECT {output.vcf_reject} "
+        "&& gatk MergeVcfs -I {input.vcf} -I {output.vcf_back} -O {output.final} > >(tee {log}) 2>&1"
+rule final:
+    input:
+        outdir + "/call-variants/{sample}.final.vcf",
+        outdir + "/call-variants/{sample}.control_region.bases.tsv",
+        outdir + "/call-variants/{sample}.non-control_region.bases.tsv",
+        outdir + "/call-variants/{sample}.control_region.stats.tsv",
+        outdir + "/call-variants/{sample}.non-control_region.stats.tsv"
+    output:
+        outdir + "/final/{sample}.final.vcf"
+    shell:
+        "[ ! -d {outdir}/final ] && mkdir {outdir}/final; "
+        "cp {input} {outdir}/final/"
+
+onsuccess:
+    print("Mito Calling Finished...")
+    shell("echo Succeed~| mail -s 'Mito Calling Finished: {project}' {mailto}")
+onerror:
+    print("Error occured...")
+    shell("cat {log}| mail -s 'Mito Calling Error: {project}' {mailto} ")
