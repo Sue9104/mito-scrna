@@ -11,7 +11,7 @@ parser.add_argument( 'infile', type=str, help='input csv, header: sample,r1,r2')
 parser.add_argument( 'project', type=str, help='project name')
 parser.add_argument( '--outdir', type=str, help='output directory',
                     default = f"mito-calling-{today}")
-parser.add_argument( '--cores', type=int, help='cpu cores', default = 40)
+parser.add_argument( '--cores', type=int, help='cpu cores', default = 50)
 parser.add_argument( '--env', type=str, help='env files', default = f"{script_path}/.env")
 args = parser.parse_args()
 os.makedirs(args.outdir, exist_ok=True)

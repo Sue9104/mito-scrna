@@ -1,0 +1,96 @@
+import os
+import pandas as pd
+
+
+genome = config["genome"]
+bed = config["bed"]
+project = config["project"]
+mailto = config["mailto"]
+outdir = os.path.abspath(config["outdir"])
+os.makedirs(outdir, exist_ok=True)
+info = pd.read_csv(config["infile"])
+samples = info["sample"].tolist()
+cols = ",".join(['1'] + [str(x) for x in range(2,2*(len(samples)+1),2)])
+
+rule all:
+    input:
+        bam = expand(outdir + "/mapping/{sample}.sorted.bam", sample=samples),
+        cov = outdir + "/qc/coverage.report",
+        chrs = outdir + "/qc/chromosomes.report",
+
+
+rule remove_adapter:
+    input: config["genome"]
+    output:
+        outdir + "/remove_adapter/{sample}_1P.fq.gz",
+        outdir + "/remove_adapter/{sample}_2P.fq.gz",
+    params:
+        prefix = outdir + "/remove_adapter/{sample}"
+    log: outdir + "/logs/remove_adapter.{sample}.log"
+    threads: 4
+    run:
+        name = os.path.basename(output[0]).replace("_1P.fq.gz","")
+        r1 = info[info["sample"]==name]["r1"].squeeze()
+        r2 = info[info["sample"]==name]["r2"].squeeze()
+        print(f"R1: {r1}\tR2: {r2}")
+        cmd  = f"[ ! -d {outdir}/remove_adapter ] && mkdir {outdir}/remove_adapter; \n"
+        cmd += f"trimmomatic PE -threads {threads} -phred33 "
+        cmd += f"  -trimlog {outdir}/remove_adapter/{name}.trimmomatic.log -summary {outdir}/remove_adapter/{name}.trimmomatic.summary "
+        cmd += f"  {r1} {r2} -baseout {params.prefix}.fq.gz "
+        cmd += f"  LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36 > >(tee {log}) 2>&1; \n"
+        subprocess.run(cmd, shell=True, executable='/bin/bash')
+
+rule mapping:
+    input:
+        rules.remove_adapter.output
+        #outdir + "/remove_adapter/{sample}_1P.fq.gz",
+        #outdir + "/remove_adapter/{sample}_2P.fq.gz",
+    output:
+        outdir + "/mapping/{sample}.sorted.bam",
+    log: outdir + "/logs/mapping.{sample}.log"
+    benchmark: outdir + "/benchmarks/mapping.{sample}.benchmarks.tsv"
+    params:
+        bwa = "bwa mem -v 3 -Y ",
+        samtools = "samtools sort -@4 -m4g ",
+        bamdst = "bamdst ",
+    threads: 24
+    resources:
+        mem_mb=60000
+    shell:
+        "[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; "
+        "{params.bwa} -t {threads} -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tLB:MT\\tPL:Illumina' {genome} {input} | "
+        "  {params.samtools} -o {output} - 2> >(tee {log} >&2); \n"
+
+rule mapping_stats:
+    input:
+        bam = outdir + "/mapping/{sample}.sorted.bam",
+        bed = bed
+    output:
+        cov = outdir + "/qc/{sample}/coverage.report.1",
+        chrs = outdir + "/qc/{sample}/chromosomes.report.1",
+    benchmark: outdir + "/benchmarks/qcstats.{sample}.benchmarks.tsv"
+    params:
+        bamdst = "bamdst ",
+    shell:
+        "[ ! -d {outdir}/qc/{wildcards.sample} ] && mkdir {outdir}/qc/{wildcards.sample}; "
+        "{params.bamdst} -p {input.bed} -o {outdir}/qc/{wildcards.sample} {input.bam} 2> >(tee {log} >&2);\n"
+        "paste <(echo -e '#Sample\n{wildcards.sample}') {outdir}/qc/{wildcards.sample}/chromosomes.report > {output.chrs} ;\n "
+        "sed -n '4,$p' {outdir}/qc/{wildcards.sample}/coverage.report | sed 's| \+ ||g'|sed '1i [Sample] Sample Name\t{wildcards.sample}' > {output.cov}; "
+
+rule merge_stats:
+    input:
+        cov = expand(outdir + "/qc/{sample}/coverage.report.1", sample = samples),
+        chrs = expand(outdir + "/qc/{sample}/chromosomes.report.1", sample = samples)
+    output:
+        cov = outdir + "/qc/coverage.report",
+        chrs = outdir + "/qc/chromosomes.report",
+    shell:
+        "cat {input.cov} > {output.cov}; "
+        "cat {input.chrs} > {output.chrs}; "
+
+onsuccess:
+    print("Mito Calling Finished...")
+    shell("echo Succeed~| mail -s 'Mito Calling Finished: {project}' {mailto}")
+onerror:
+    print("Error occured...")
+    shell("cat {log}| mail -s 'Mito Calling Error: {project}' {mailto} ")

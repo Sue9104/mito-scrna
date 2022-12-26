@@ -1,9 +1,12 @@
 genome=Homo_sapiens_assembly38.chrM.fasta
 genome_shift=Homo_sapiens_assembly38.chrM.shifted_by_8000_bases.fasta
-noncontrol_region=chrM:576-16024
-noncontrol_region_interval=non_control_region.interval_list
-control_region_shift=chrM:8025-9144
-control_region_shift_interval=control_region_shifted.chrM.interval_list
+genome_bed=genome.bed
+mt_bed=MT.bed
+mt_len=16569
+nonctr=chrM:576-16024
+nonctr_interval=non_control_region.interval_list
+ctrshift=chrM:8025-9144
+ctrshift_interval=control_region_shifted.chrM.interval_list
 chain=ShiftBack.chain
 
 mailto=user@mail.com

@@ -3,43 +3,62 @@ import pandas as pd
 
 
 genome = config["genome"]
+mt_bed = config["mt_bed"]
+mt_len = config["mt_len"]
 project = config["project"]
 mailto = config["mailto"]
 outdir = os.path.abspath(config["outdir"])
 os.makedirs(outdir, exist_ok=True)
 info = pd.read_csv(config["infile"])
 samples = info["sample"].tolist()
+# extract columns using cut
+cols = ",".join(['1'] + [str(x) for x in range(2,2*(len(samples)+1),2)])
+# extract rows using sed
+rows = ";".join(['1p'] + [str(x) + 'p' for x in range(2,2*(len(samples)+1),2)])
 
-workdir: outdir
 rule all:
     input:
-        expand([outdir + "/final/{sample}.final.vcf"], sample=samples)
+        outdir + "/final/final.raw.vcf",
+        #outdir + "/final/final.filtered.vcf",
+        outdir + "/final/chromosomes.report",
+        outdir + "/final/coverage.report",
 
+#ruleorder: mapping > mapping_shift > call_mt > call_mt_shift > liftover_combinevcf > merge_sample_vcfs
+#ruleorder: mapping > mapping_shift
+#ruleorder: call_mt > call_mt_shift
 rule mapping:
     input:
         genome = config["genome"]
     output:
-        sort = outdir + "/mapping/{sample}.sorted.bam",
-        mark = outdir + "/mapping/{sample}.marked.bam",
-        metrics = outdir + "/mapping/{sample}.markdup_metrics.txt"
+        sort = outdir + "/mapping/{sample}.nonctr.sorted.bam",
+        mark = outdir + "/mapping/{sample}.nonctr.marked.bam",
+        metrics = outdir + "/mapping/{sample}.nonstr.markdup_metrics.txt",
+        qc_chr = outdir + "/qc/{sample}/chromosomes.report.1",
+        qc_cov = outdir + "/qc/{sample}/coverage.report.1",
     log: outdir + "/logs/mapping.{sample}.log"
     benchmark: outdir + "/benchmarks/mapping.{sample}.benchmarks.tsv"
     params:
         bwa = "bwa mem -K 100000000 -v 3 -Y ",
-        samtools = "samtools sort ",
-        gatk = "gatk --java-options '-Xmx40G' MarkDuplicatesSpark"
-    threads: 40
+        samtools = "samtools sort -@4 -m4g ",
+        bamdst = "bamdst ",
+        gatk = "gatk --java-options '-Xmx32G' MarkDuplicatesSpark"
+    threads: 24
+    resources:
+        mem_mb=60000
     run:
         os.makedirs(os.path.join(outdir, "mapping"), exist_ok=True)
-        sample = os.path.basename(output.sort).replace(".sorted.bam","")
+        sample = os.path.basename(output.sort).replace(".nonctr.sorted.bam","")
         r1 = info[info["sample"]==sample]["r1"].squeeze()
         r2 = info[info["sample"]==sample]["r2"].squeeze()
+        print(f"R1: {r1}\tR2: {r2}")
         cmd  = f"[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; "
-        cmd += f"{params.bwa} -t {threads} -R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:MT\\tPL:Illumina' "
-        cmd += f"{genome} {r1} {r2} 2> >(tee {log} >&2) | "
-        cmd += f"{params.samtools} -@ {threads} -o {output.sort} -; "
-        cmd += f"{params.gatk} -conf 'spark.executor.cores={threads} ' "
-        cmd += f"--input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;"
+        cmd += f"{params.bwa} -t {threads} -R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:MT\\tPL:Illumina' {genome} {r1} {r2} | "
+        cmd += f"  {params.samtools} -o {output.sort} - 2> >(tee {log} >&2); "
+        cmd += f"[ ! -d {outdir}/qc/{sample} ] && mkdir {outdir}/qc/{sample}; "
+        cmd += f"{params.bamdst} -p {mt_bed} -o {outdir}/qc/{sample} {output.sort} 2> >(tee {log} >&2);"
+        cmd += f"paste <(echo -e '#Sample\n{sample}') {outdir}/qc/{sample}/chromosomes.report > {outdir}/qc/{sample}/chromosomes.report.1; "
+        cmd += f"sed -n '4,$p' {outdir}/qc/{sample}/coverage.report | sed 's| \+ ||g'|sed '1i [Sample] Sample Name\t{sample}' > {outdir}/qc/{sample}/coverage.report.1; "
+        cmd += f"{params.gatk} -conf 'spark.executor.cores={threads}' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;"
         print(cmd)
         subprocess.run(cmd, shell=True, executable='/bin/bash')
 
@@ -47,38 +66,40 @@ rule mapping_shift:
     input:
         genome = config["genome_shift"]
     output:
-        sort = outdir + "/mapping/{sample}.shift.sorted.bam",
-        mark = outdir + "/mapping/{sample}.shift.marked.bam",
-        metrics = outdir + "/mapping/{sample}.shift.markdup_metrics.txt"
-    log: outdir + "logs/mapping.{sample}.shift.log"
+        sort = outdir + "/mapping/{sample}.ctrshift.sorted.bam",
+        mark = outdir + "/mapping/{sample}.ctrshift.marked.bam",
+        metrics = outdir + "/mapping/{sample}.ctrshift.markdup_metrics.txt"
+    log: outdir + "/logs/mapping.{sample}.ctrshift.log"
     benchmark: outdir + "/benchmarks/mapping.{sample}.shift.benchmarks.tsv"
     params:
-        bwa = "bwa mem -K 100000000 -p -v 3 -Y ",
-        samtools = "samtools sort ",
-        gatk = "gatk --java-options '-Xmx60G' MarkDuplicatesSpark"
-    threads: 40
+        bwa = "bwa mem -K 100000000 -v 3 -Y ",
+        samtools = "samtools sort -@4 -m4g ",
+        gatk = "gatk --java-options '-Xmx32G' MarkDuplicatesSpark"
+    threads: 24
+    resources:
+        mem_mb=60000
     run:
-        sample = os.path.basename(output.sort).replace(".sorted.bam","")
+        sample = os.path.basename(output.sort).replace(".ctrshift.sorted.bam","")
         r1 = info[info["sample"]==sample]["r1"].squeeze()
         r2 = info[info["sample"]==sample]["r2"].squeeze()
-        cmd  = f"{params.bwa} -t {threads} {genome} {r1} {r2} 2> >(tee {log}>&2) | "
-        cmd += f"{params.samtools} -@ {threads} -o {output.sort} -; "
-        cmd += f" {params.gatk} -conf 'spark.executor.cores={threads}' "
-        cmd += f"--input {input} --output {output.mark} --metrics-file {output.metrics} "
-        cmd += f"> >(tee {log}) 2>&1;"
+        print(f"R1: {r1}\tR2: {r2}")
+        cmd  = f"[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; "
+        cmd += f"{params.bwa} -t {threads} -R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:MT\\tPL:Illumina' {genome} {r1} {r2} | "
+        cmd += f"  {params.samtools} -o {output.sort} - 2> >(tee {log} >&2); "
+        cmd += f"{params.gatk} -conf 'spark.executor.cores={threads} ' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;"
         print(cmd)
         subprocess.run(cmd, shell=True, executable='/bin/bash')
 
 
 rule collect_metrics:
     input:
-        outdir + "/mapping/{sample}.marked.bam"
+        outdir + "/mapping/{sample}.nonctr.marked.bam"
     output:
-        outdir + "/mapping/{sample}.mt.metrics.txt"
+        outdir + "/mapping/{sample}.nonctr.wgs.metrics.txt"
     params:
         read_length = 150,
         coverage_cap = 100000
-    threads: 40
+    threads: 1
     benchmark: outdir + "/benchmarks/collectwgs.{sample}.benchmarks.tsv"
     log: outdir + "/logs/collectwgs.{sample}.log"
     shell:
@@ -86,86 +107,113 @@ rule collect_metrics:
         "-CAP {params.coverage_cap} --READ_LENGTH {params.read_length}  "
         "-R {genome} -I {input} -O {output} > >(tee {log}) 2>&1"
 
+
 rule call_mt:
     input:
-        bam = outdir + "/mapping/{sample}.marked.bam",
+        bam = outdir + "/mapping/{sample}.nonctr.marked.bam",
         genome = config["genome"],
-        interval = config["noncontrol_region_interval"]
+        interval = config["nonctr_interval"]
     output:
-        bam = outdir + "/call-variants/{sample}.non-control_region.bam",
-        vcf = outdir + "/call-variants/{sample}.non-control_region.vcf",
-        metrics = outdir + "/call-variants/{sample}.non-control_region.metrics.tsv",
-        base = outdir + "/call-variants/{sample}.non-control_region.bases.tsv",
-        stat = outdir + "/call-variants/{sample}.non-control_region.stats.tsv"
-    threads: 40
+        vcf = outdir + "/call-variants/{sample}.nonctr.vcf",
+        #filtered = outdir + "/call-variants/{sample}.nonctr.filtered.vcf",
+    threads: 10
+    resources:
+        mem_mb=32000
     benchmark: outdir + "/benchmarks/callmt.{sample}.benchmarks.tsv"
     log: outdir + "/logs/callmt.{sample}.log"
     params:
-        gatk_mutect2 = "gatk --java-options '-Xmx64G' Mutect2 --mitochondria-mode --max-reads-per-alignment-start 75 --max-mnp-distance 0",
+        gatk_mutect2 = "gatk --java-options '-Xmx32G' Mutect2 --mitochondria-mode --max-reads-per-alignment-start 75 --max-mnp-distance 0",
         gatk_collecths = "gatk  CollectHsMetrics --SAMPLE_SIZE 1 -covMax 20000 ",
-        region = config["noncontrol_region"],
+        gatk_mutect2filter = "gatk --java-options '-Xmx32G' FilterMutectCalls --mitochondria-mode ",
+        region = config["nonctr"],
+        prefix = outdir + "/call-variants/{sample}"
     shell:
         "[ ! -d {outdir}/call-variants ] && mkdir {outdir}/call-variants; "
-        "{params.gatk_mutect2} -R {input.genome} -L {params.region} "
-        "  -I {input.bam} --bam-output {output.bam} -O {output.vcf} "
-        "&& {params.gatk_collecths} -R {input.genome} -TI {input.interval} -BI {input.interval} "
-        "  -I {input.bam} -O {output.metrics} --PER_BASE_COVERAGE {output.base} > >(tee {log}) 2>&1;"
-        "paste <(sed -n '7p' {output.metrics}| tr '\t' '\n') <(sed -n '8p' {output.metrics}| tr '\t' '\n') > {output.stat}"
+        "{params.gatk_mutect2} --native-pair-hmm-threads {threads} -R {input.genome} -L {params.region} -I {input.bam} --bam-output {params.prefix}.nonctr.bam -O {output.vcf} > >(tee {log}) 2>&1 ; \n"
+        #"{params.gatk_mutect2filter} -R {input.genome} -L {params.region} -V {output.vcf} -O {output.filtered}  > >(tee {log}) 2>&1; \n"
+        "{params.gatk_collecths} -R {input.genome} -TI {input.interval} -BI {input.interval} -I {input.bam} -O {params.prefix}.nonctr.metrics.tsv --PER_BASE_COVERAGE {params.prefix}.nonctr.bases.tsv  > >(tee {log}) 2>&1; \n"
+        "paste <(sed -n '7p' {params.prefix}.nonctr.metrics.tsv| tr '\t' '\n') <(sed -n '8p' {params.prefix}.nonctr.metrics.tsv| tr '\t' '\n') > {params.prefix}.nonctr.stats.tsv;"
 
 rule call_mt_shift:
     input:
-        bam = outdir + "/mapping/{sample}.marked.bam",
+        bam = outdir + "/mapping/{sample}.ctrshift.marked.bam",
         genome = config["genome_shift"],
-        interval = config["control_region_shift_interval"],
+        interval = config["ctrshift_interval"],
     output:
-        bam = outdir + "/call-variants/{sample}.control_region.bam",
-        vcf = outdir + "/call-variants/{sample}.control_region.vcf",
-        metrics = outdir + "/call-variants/{sample}.control_region.metrics.tsv",
-        base = outdir + "/call-variants/{sample}.control_region.bases.tsv",
-        stat = outdir + "/call-variants/{sample}.control_region.stats.tsv"
-    threads: 40
+        vcf = outdir + "/call-variants/{sample}.ctrshift.vcf",
+        #filtered = outdir + "/call-variants/{sample}.ctrshift.filtered.vcf",
+    threads: 10
+    resources:
+        mem_mb=32000
     benchmark: outdir + "/benchmarks/callmtshift.{sample}.benchmarks.tsv"
     log: outdir + "/logs/callmtshift.{sample}.log"
     params:
-        gatk_mutect2 = "gatk --java-options '-Xmx64G' Mutect2 --mitochondria-mode --max-reads-per-alignment-start 75 --max-mnp-distance 0",
+        gatk_mutect2 = "gatk --java-options '-Xmx32G' Mutect2 --mitochondria-mode --max-reads-per-alignment-start 75 --max-mnp-distance 0",
+        gatk_mutect2filter = "gatk --java-options '-Xmx32G' FilterMutectCalls --mitochondria-mode ",
         gatk_collecths = "gatk  CollectHsMetrics --SAMPLE_SIZE 1 -covMax 20000 ",
-        region = config["control_region_shift"],
+        region = config["ctrshift"],
+        prefix = outdir + "/call-variants/{sample}"
     shell:
         "[ ! -d {outdir}/call-variants ] && mkdir {outdir}/call-variants; "
-        "{params.gatk_mutect2} -R {input.genome} -L {params.region} "
-        "  -I {input.bam} --bam-output {output.bam} -O {output.vcf} "
-        "&& {params.gatk_collecths} -R {input.genome} -TI {input.interval} -BI {input.interval} "
-        "  -I {input.bam} -O {output.metrics} --PER_BASE_COVERAGE {output.base} > >(tee {log}) 2>&1;"
-        "paste <(sed -n '7p' {output.metrics}| tr '\t' '\n') <(sed -n '8p' {output.metrics}| tr '\t' '\n') > {output.stat}"
+        "{params.gatk_mutect2} --native-pair-hmm-threads {threads} -R {input.genome} -L {params.region} -I {input.bam} --bam-output {params.prefix}.ctrshift.bam -O {output.vcf} > >(tee {log}) 2>&1;\n "
+        #"{params.gatk_mutect2filter} -R {input.genome} -L {params.region} -V {output.vcf} -O {output.filtered} > >(tee {log}) 2>&1;\n "
+        "{params.gatk_collecths} -R {input.genome} -TI {input.interval} -BI {input.interval} -I {input.bam} -O {params.prefix}.ctrshift.metrics.tsv --PER_BASE_COVERAGE {params.prefix}.ctrshift.bases.tsv > >(tee {log}) 2>&1;\n"
+        "awk -v FS='\\t' -v OFS='\\t' '{{if ($2>{mt_len} - 8000){{$2=$2+8000-{mt_len}}}else{{$2=$2+8000}}; print $0}}' {params.prefix}.ctrshift.bases.tsv > {params.prefix}.ctr.bases.tsv; \n"
+        "paste <(sed -n '7p' {params.prefix}.ctrshift.metrics.tsv| tr '\t' '\n') <(sed -n '8p' {params.prefix}.ctrshift.metrics.tsv| tr '\t' '\n') > {params.prefix}.ctr.stats.tsv"
 
 
 rule liftover_combinevcf:
     input:
-        vcf = outdir + "/call-variants/{sample}.non-control_region.vcf",
-        vcf_shift = outdir + "/call-variants/{sample}.control_region.vcf",
+        vcf = outdir + "/call-variants/{sample}.nonctr.vcf",
+        vcf_shift = outdir + "/call-variants/{sample}.ctrshift.vcf",
+        #vcf_filtered = outdir + "/call-variants/{sample}.nonctr.filtered.vcf",
+        #vcf_shift_filtered = outdir + "/call-variants/{sample}.ctrshift.filtered.vcf",
         chain = config["chain"]
     output:
-        vcf_back = outdir + "/call-variants/{sample}.control_region.shiftback.vcf",
-        vcf_reject = outdir + "/call-variants/{sample}.control_region.shiftback.rejected.vcf",
-        final = outdir + "/call-variants/{sample}.final.vcf"
+        raw = outdir + "/call-variants/{sample}.raw.vcf.gz",
+        #filtered = outdir + "/call-variants/{sample}.filtered.vcf.gz"
+    params:
+        prefix = outdir + "/call-variants/{sample}"
+    threads: 1
     benchmark: outdir + "/benchmarks/liftover.{sample}.benchmarks.tsv"
     log: outdir + "/logs/liftover.{sample}.log"
     shell:
-        "gatk LiftoverVcf -R {genome} -C {input.chain} "
-        "-I {input.vcf_shift} -O {output.vcf_back} --REJECT {output.vcf_reject} "
-        "&& gatk MergeVcfs -I {input.vcf} -I {output.vcf_back} -O {output.final} > >(tee {log}) 2>&1"
+        "gatk LiftoverVcf -R {genome} -C {input.chain} -I {input.vcf_shift} -O {params.prefix}.ctr.vcf --REJECT {params.prefix}.ctr.rejected.vcf 2> >(tee {log} >&2) "
+        "&& gatk MergeVcfs -I {input.vcf} -I {params.prefix}.ctr.vcf -O {params.prefix}.raw.vcf > >(tee {log}) 2>&1;\n"
+        #"gatk LiftoverVcf -R {genome} -C {input.chain} -I {input.vcf_shift_filtered} -O {params.prefix}.ctr.filtered.vcf --REJECT {params.prefix}.ctr.rejected.filtered.vcf 2> >(tee {log} >&2) "
+        #"&& gatk MergeVcfs -I {input.vcf_filtered} -I {params.prefix}.ctr.filtered.vcf -O {params.prefix}.filtered.vcf > >(tee {log}) 2>&1;\n"
+        "bgzip {params.prefix}.raw.vcf && tabix -f {params.prefix}.raw.vcf.gz; \n"
+        #"bgzip {params.prefix}.filtered.vcf && tabix -f {params.prefix}.filtered.vcf.gz; \n"
+        "cat {params.prefix}.nonctr.bases.tsv <(sed '1d' {params.prefix}.ctr.bases.tsv) | sort -k2n > {params.prefix}.mt.bases.tsv;"
+
+rule merge_sample_vcfs:
+    input:
+        raw = expand(outdir + "/call-variants/{sample}.raw.vcf.gz", sample = samples),
+        #filtered = expand(outdir + "/call-variants/{sample}.filtered.vcf.gz", sample=samples)
+    output:
+        raw = outdir + "/final/final.raw.vcf",
+        #filtered = outdir + "/final/final.filtered.vcf"
+    threads: 1
+    shell:
+        "[ ! -d {outdir}/final ] && mkdir {outdir}/final; \n"
+        "vcfs=({outdir}/call-variants/*raw.vcf.gz); if ((${{#vcfs[@]}} == 1)); then cp ${{vcfs}} {output.raw}; else bcftools merge {input.raw} -o {output.raw}; fi;\n"
+        #"vcfs=({outdir}/call-variants/*filtered.vcf.gz); if ((${{#vcfs[@]}} == 1)); then cp ${{vcfs}} {output.filtered}; else bcftools merge {input.filtered} -o {output.filtered}; fi;\n"
+        "cp {outdir}/call-variants/*mt.bases.tsv {outdir}/final;\n"
+        "cp {outdir}/call-variants/*stats.tsv {outdir}/final;\n"
+
 rule final:
     input:
-        outdir + "/call-variants/{sample}.final.vcf",
-        outdir + "/call-variants/{sample}.control_region.bases.tsv",
-        outdir + "/call-variants/{sample}.non-control_region.bases.tsv",
-        outdir + "/call-variants/{sample}.control_region.stats.tsv",
-        outdir + "/call-variants/{sample}.non-control_region.stats.tsv"
+        expand([outdir + "/qc/{sample}/chromosomes.report.1",
+                outdir + "/qc/{sample}/coverage.report.1"],
+               sample=samples)
     output:
-        outdir + "/final/{sample}.final.vcf"
+        outdir + "/final/chromosomes.report",
+        outdir + "/final/coverage.report"
+    threads: 1
     shell:
         "[ ! -d {outdir}/final ] && mkdir {outdir}/final; "
-        "cp {input} {outdir}/final/"
+        "cat {outdir}/qc/*/chromosomes.report.1 | sed -n '{rows}' > {outdir}/final/chromosomes.report; "
+        "paste {outdir}/qc/*/coverage.report.1 | cut -f{cols}> {outdir}/final/coverage.report; "
 
 onsuccess:
     print("Mito Calling Finished...")
