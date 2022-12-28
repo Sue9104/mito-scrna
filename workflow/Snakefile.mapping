@@ -3,7 +3,7 @@ import pandas as pd
 
 
 genome = config["genome"]
-bed = config["bed"]
+bed = config["genome_bed"]
 project = config["project"]
 mailto = config["mailto"]
 outdir = os.path.abspath(config["outdir"])
@@ -68,25 +68,30 @@ rule mapping_stats:
     output:
         cov = outdir + "/qc/{sample}/coverage.report.1",
         chrs = outdir + "/qc/{sample}/chromosomes.report.1",
+        chrs_2 = outdir + "/qc/{sample}/chromosomes.report.csv",
     benchmark: outdir + "/benchmarks/qcstats.{sample}.benchmarks.tsv"
     params:
         bamdst = "bamdst ",
     shell:
         "[ ! -d {outdir}/qc/{wildcards.sample} ] && mkdir {outdir}/qc/{wildcards.sample}; "
         "{params.bamdst} -p {input.bed} -o {outdir}/qc/{wildcards.sample} {input.bam} 2> >(tee {log} >&2);\n"
-        "paste <(echo -e '#Sample\n{wildcards.sample}') {outdir}/qc/{wildcards.sample}/chromosomes.report > {output.chrs} ;\n "
+        "samtools index {input.bam}; total=$(samtools view -c {input.bam});for i in {{1..20}} 'X' 'Y' 'MT' ''; do count=$(samtools view -c -F 4 {input.bam} $i); echo '{wildcards.sample}',$i,$count,$total; done | awk -F, -v OFS=',' '{{$4=$3/$4*100; print $0}}' | sed '1i #Sample,Chromosomes,MappedReads,MappedRatio' | sed 's|,,|,Total,|g' > {output.chrs_2} ;\n"
+        "paste <(echo -e '#Sample\\n{wildcards.sample}') <(sort -k1n {outdir}/qc/{wildcards.sample}/chromosomes.report) > {output.chrs} ;\n "
         "sed -n '4,$p' {outdir}/qc/{wildcards.sample}/coverage.report | sed 's| \+ ||g'|sed '1i [Sample] Sample Name\t{wildcards.sample}' > {output.cov}; "
 
 rule merge_stats:
     input:
         cov = expand(outdir + "/qc/{sample}/coverage.report.1", sample = samples),
-        chrs = expand(outdir + "/qc/{sample}/chromosomes.report.1", sample = samples)
+        chrs = expand(outdir + "/qc/{sample}/chromosomes.report.1", sample = samples),
+        chrs_2 = expand(outdir + "/qc/{sample}/chromosomes.report.csv", sample = samples)
     output:
         cov = outdir + "/qc/coverage.report",
         chrs = outdir + "/qc/chromosomes.report",
+        chrs_2 = outdir + "/qc/chromosomes.report.csv",
     shell:
-        "cat {input.cov} > {output.cov}; "
+        "paste {input.cov} | cut -f{cols} > {output.cov}; "
         "cat {input.chrs} > {output.chrs}; "
+        "cat {input.chrs_2} > {output.chrs_2}; "
 
 onsuccess:
     print("Mito Calling Finished...")

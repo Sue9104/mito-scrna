@@ -26,9 +26,32 @@ rule all:
 #ruleorder: mapping > mapping_shift > call_mt > call_mt_shift > liftover_combinevcf > merge_sample_vcfs
 #ruleorder: mapping > mapping_shift
 #ruleorder: call_mt > call_mt_shift
+rule remove_adapter:
+    input: config["genome"]
+    output:
+        outdir + "/remove_adapter/{sample}_1P.fq.gz",
+        outdir + "/remove_adapter/{sample}_2P.fq.gz",
+    params:
+        prefix = outdir + "/remove_adapter/{sample}"
+    log: outdir + "/logs/remove_adapter.{sample}.log"
+    threads: 4
+    run:
+        name = os.path.basename(output[0]).replace("_1P.fq.gz","")
+        r1 = info[info["sample"]==name]["r1"].squeeze()
+        r2 = info[info["sample"]==name]["r2"].squeeze()
+        print(f"R1: {r1}\tR2: {r2}")
+        cmd  = f"[ ! -d {outdir}/remove_adapter ] && mkdir {outdir}/remove_adapter; \n"
+        cmd += f"trimmomatic PE -threads {threads} -phred33 "
+        cmd += f"  -trimlog {outdir}/remove_adapter/{name}.trimmomatic.log -summary {outdir}/remove_adapter/{name}.trimmomatic.summary "
+        cmd += f"  {r1} {r2} -baseout {params.prefix}.fq.gz "
+        cmd += f"  LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36 > >(tee {log}) 2>&1; \n"
+        subprocess.run(cmd, shell=True, executable='/bin/bash')
+
 rule mapping:
     input:
-        genome = config["genome"]
+        #rules.remove_adapter.output
+        outdir + "/remove_adapter/{sample}_1P.fq.gz",
+        outdir + "/remove_adapter/{sample}_2P.fq.gz",
     output:
         sort = outdir + "/mapping/{sample}.nonctr.sorted.bam",
         mark = outdir + "/mapping/{sample}.nonctr.marked.bam",
@@ -38,33 +61,28 @@ rule mapping:
     log: outdir + "/logs/mapping.{sample}.log"
     benchmark: outdir + "/benchmarks/mapping.{sample}.benchmarks.tsv"
     params:
-        bwa = "bwa mem -K 100000000 -v 3 -Y ",
+        bwa = "bwa mem -v 3 -Y ",
         samtools = "samtools sort -@4 -m4g ",
         bamdst = "bamdst ",
-        gatk = "gatk --java-options '-Xmx32G' MarkDuplicatesSpark"
+        gatk = "gatk --java-options '-Xmx32G' MarkDuplicatesSpark",
     threads: 24
     resources:
         mem_mb=60000
-    run:
-        os.makedirs(os.path.join(outdir, "mapping"), exist_ok=True)
-        sample = os.path.basename(output.sort).replace(".nonctr.sorted.bam","")
-        r1 = info[info["sample"]==sample]["r1"].squeeze()
-        r2 = info[info["sample"]==sample]["r2"].squeeze()
-        print(f"R1: {r1}\tR2: {r2}")
-        cmd  = f"[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; "
-        cmd += f"{params.bwa} -t {threads} -R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:MT\\tPL:Illumina' {genome} {r1} {r2} | "
-        cmd += f"  {params.samtools} -o {output.sort} - 2> >(tee {log} >&2); "
-        cmd += f"[ ! -d {outdir}/qc/{sample} ] && mkdir {outdir}/qc/{sample}; "
-        cmd += f"{params.bamdst} -p {mt_bed} -o {outdir}/qc/{sample} {output.sort} 2> >(tee {log} >&2);"
-        cmd += f"paste <(echo -e '#Sample\n{sample}') {outdir}/qc/{sample}/chromosomes.report > {outdir}/qc/{sample}/chromosomes.report.1; "
-        cmd += f"sed -n '4,$p' {outdir}/qc/{sample}/coverage.report | sed 's| \+ ||g'|sed '1i [Sample] Sample Name\t{sample}' > {outdir}/qc/{sample}/coverage.report.1; "
-        cmd += f"{params.gatk} -conf 'spark.executor.cores={threads}' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;"
-        print(cmd)
-        subprocess.run(cmd, shell=True, executable='/bin/bash')
+    shell:
+        "[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; \n"
+        "{params.bwa} -t {threads} -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tLB:MT\\tPL:Illumina' {genome} {input} | "
+        "  {params.samtools} -o {output.sort} - > >(tee {log}) 2>&1; "
+        "[ ! -d {outdir}/qc/{wildcards.sample} ] && mkdir {outdir}/qc/{wildcards.sample}; \n"
+        "{params.bamdst} -p {mt_bed} -o {outdir}/qc/{wildcards.sample} {output.sort} ; \n"
+        "paste <(echo -e '#Sample\n{wildcards.sample}') {outdir}/qc/{wildcards.sample}/chromosomes.report > {outdir}/qc/{wildcards.sample}/chromosomes.report.1; \n"
+        "sed -n '4,$p' {outdir}/qc/{wildcards.sample}/coverage.report | sed 's| \+ ||g'|sed '1i [Sample] Sample Name\t{wildcards.sample}' > {outdir}/qc/{wildcards.sample}/coverage.report.1; \n"
+        "{params.gatk} -conf 'spark.executor.cores={threads}' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;\n"
 
 rule mapping_shift:
     input:
-        genome = config["genome_shift"]
+        #rules.remove_adapter.output
+        outdir + "/remove_adapter/{sample}_1P.fq.gz",
+        outdir + "/remove_adapter/{sample}_2P.fq.gz",
     output:
         sort = outdir + "/mapping/{sample}.ctrshift.sorted.bam",
         mark = outdir + "/mapping/{sample}.ctrshift.marked.bam",
@@ -72,23 +90,17 @@ rule mapping_shift:
     log: outdir + "/logs/mapping.{sample}.ctrshift.log"
     benchmark: outdir + "/benchmarks/mapping.{sample}.shift.benchmarks.tsv"
     params:
-        bwa = "bwa mem -K 100000000 -v 3 -Y ",
+        bwa = "bwa mem -v 3 -Y ",
         samtools = "samtools sort -@4 -m4g ",
-        gatk = "gatk --java-options '-Xmx32G' MarkDuplicatesSpark"
+        gatk = "gatk --java-options '-Xmx32G' MarkDuplicatesSpark",
     threads: 24
     resources:
         mem_mb=60000
-    run:
-        sample = os.path.basename(output.sort).replace(".ctrshift.sorted.bam","")
-        r1 = info[info["sample"]==sample]["r1"].squeeze()
-        r2 = info[info["sample"]==sample]["r2"].squeeze()
-        print(f"R1: {r1}\tR2: {r2}")
-        cmd  = f"[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; "
-        cmd += f"{params.bwa} -t {threads} -R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:MT\\tPL:Illumina' {genome} {r1} {r2} | "
-        cmd += f"  {params.samtools} -o {output.sort} - 2> >(tee {log} >&2); "
-        cmd += f"{params.gatk} -conf 'spark.executor.cores={threads} ' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;"
-        print(cmd)
-        subprocess.run(cmd, shell=True, executable='/bin/bash')
+    shell:
+        "[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; \n"
+        "{params.bwa} -t {threads} -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tLB:MT\\tPL:Illumina' {genome} {input} | "
+        "  {params.samtools} -o {output.sort} - > >(tee {log}) 2>&1; \n"
+        "{params.gatk} -conf 'spark.executor.cores={threads} ' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1; \n"
 
 
 rule collect_metrics:
