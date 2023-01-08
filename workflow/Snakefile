@@ -5,8 +5,10 @@ import pandas as pd
 genome = config["genome"]
 mt_bed = config["mt_bed"]
 mt_len = config["mt_len"]
+mt_interval = config["mt_interval"]
 project = config["project"]
 mailto = config["mailto"]
+
 outdir = os.path.abspath(config["outdir"])
 os.makedirs(outdir, exist_ok=True)
 info = pd.read_csv(config["infile"])
@@ -72,11 +74,11 @@ rule mapping:
         "[ ! -d {outdir}/mapping ] && mkdir {outdir}/mapping; \n"
         "{params.bwa} -t {threads} -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tLB:MT\\tPL:Illumina' {genome} {input} | "
         "  {params.samtools} -o {output.sort} - > >(tee {log}) 2>&1; "
+        "{params.gatk} -conf 'spark.executor.cores={threads}' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;\n"
         "[ ! -d {outdir}/qc/{wildcards.sample} ] && mkdir {outdir}/qc/{wildcards.sample}; \n"
-        "{params.bamdst} -p {mt_bed} -o {outdir}/qc/{wildcards.sample} {output.sort} ; \n"
+        "{params.bamdst} -p {mt_bed} -o {outdir}/qc/{wildcards.sample} {output.mark} ; \n"
         "paste <(echo -e '#Sample\n{wildcards.sample}') {outdir}/qc/{wildcards.sample}/chromosomes.report > {outdir}/qc/{wildcards.sample}/chromosomes.report.1; \n"
         "sed -n '4,$p' {outdir}/qc/{wildcards.sample}/coverage.report | sed 's| \+ ||g'|sed '1i [Sample] Sample Name\t{wildcards.sample}' > {outdir}/qc/{wildcards.sample}/coverage.report.1; \n"
-        "{params.gatk} -conf 'spark.executor.cores={threads}' --input {output.sort} --output {output.mark} --metrics-file {output.metrics} > >(tee {log}) 2>&1;\n"
 
 rule mapping_shift:
     input:
@@ -226,6 +228,27 @@ rule final:
         "[ ! -d {outdir}/final ] && mkdir {outdir}/final; "
         "cat {outdir}/qc/*/chromosomes.report.1 | sed -n '{rows}' > {outdir}/final/chromosomes.report; "
         "paste {outdir}/qc/*/coverage.report.1 | cut -f{cols}> {outdir}/final/coverage.report; "
+
+
+rule sv:
+    input:
+        bam = outdir + "/mapping/{sample}.nonctr.marked.bam",
+        vcf = outdir + "/call-variants/{sample}.raw.vcf.gz"
+    output:
+        vcf_manta = outdir + "/sv/{sample}.sv.manta.vcf.gz",
+        vcf_whamg = outdir + "/sv/{sample}.sv.whamg.vcf"
+    params:
+        manta = config["manta"],
+        whamt = config["whamg"],
+        prefix = outdir + "/sv/{sample}"
+    threads: 1
+    shell:
+        "[ ! -d {outdir}/sv ] && mkdir {outdir}/sv; \n"
+        "gatk CollectSVEvidence -R {genome} -L {mt_interval} -DI {mt_interval} -I {input.bam} -F {input.vcf} --sample-name {wildcards.sample} -RD {params.prefix}.RD.txt -SR {params.prefix}.SR.txt -PE {params.prefix}.PE.txt -SD {params.prefix}.SD.txt; \n"
+        "[ ! -d {outdir}/sv/manta ] && mkdir {outdir}/sv/manta; \n"
+        "python2 {params.manta} --referenceFasta {genome}  --callRegions {mt_bed}.gz --tumorBam {input.bam} --runDir {outdir}/sv/manta/{wildcards.sample} && python2 {outdir}/sv/manta/{wildcards.sample}/runWorkflow.py --mode local; \n"
+        "cp {outdir}/sv/manta/{wildcards.sample}/results/variants/tumorSV.vcf.gz {outdir}/sv/{wildcards.sample}.sv.manta.vcf.gz; \n"
+        "{params.whamg} -f {input.bam} -a {genome} > {outdir}/sv/{wildcards.sample}.sv.whamg.vcf; \n"
 
 onsuccess:
     print("Mito Calling Finished...")
